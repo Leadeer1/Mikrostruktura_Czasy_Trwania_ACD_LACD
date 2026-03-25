@@ -1,0 +1,1715 @@
+---
+title: "Analiza transakcyjnych czasów trwania oraz czasów trwania ceny dla spółki H i spółki L"
+author: "Jakub Morawski, Paweł Modzelewski"
+date: "2026-01-21"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(kableExtra)
+library(tidyverse)
+library(lubridate)
+library(ACDm)
+library(gridExtra)
+library(ggplot2)
+library(e1071)
+library(kSamples)
+library(lmtest)
+library(goftest)
+library(forecast)
+```
+
+# 1. Transakcyjne czasy trwania
+
+## 1.1. Wgranie i przygotowanie danych
+
+```{r load_and_prepare_data}
+daneH <- read.csv("spolkaH.csv", dec=".", sep=";")
+daneL <- read.csv("spolkaL.csv", dec=".", sep=";")
+
+convert_to_datetime <- function(df){
+  date_str <- sprintf("%s-%s-%s",
+                      substr(df$daty, 1, 4),
+                      substr(df$daty, 5, 6),
+                      substr(df$daty, 7, 8))
+  time_str <- sprintf("%02d:%02d:%02d",
+                      as.integer(df$godz/10000),
+                      as.integer((df$godz %% 10000) / 100),
+                      df$godz %% 100)
+  df$datetime <- ymd_hms(paste(date_str, time_str))
+  return(df)
+}
+
+daneH <- convert_to_datetime(daneH)
+daneL <- convert_to_datetime(daneL)
+
+start_date <- as.POSIXct("2019-01-01 00:00:00") 
+end_date   <- as.POSIXct("2019-06-30 00:00:00")
+
+daneH <- daneH %>% filter(datetime >= start_date & datetime <= end_date + days(1) - seconds(1))
+daneL <- daneL %>% filter(datetime >= start_date & datetime <= end_date + days(1) - seconds(1))
+
+filter_trading_hours <- function(df){
+  start <- hms("09:00:00")
+  end <- hms("16:50:00")
+  
+  df$time <- hms(format(df$datetime, "%H:%M:%S"))
+  
+  df <- df %>%
+    filter(time >= start, time <= end)
+  
+  return(df)
+}
+
+daneH <- filter_trading_hours(daneH)
+daneL <- filter_trading_hours(daneL)
+
+daneH <- daneH %>% arrange(datetime)
+daneL <- daneL %>% arrange(datetime)
+
+head(daneL) %>%
+  kbl(caption="Dane dla spółki L") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+                
+head(daneH) %>%
+  kbl(caption="Dane dla spółki H") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+```
+
+Załadowaliśmy dane dla spółek H i L i ograniczyliśmy je poprawnie dla okresu od 2019-01-01 do 2019-06-30, biorąc pod uwagę jedynie godziny 9:00-16:50.
+
+## 1.2. Agregacja danych do mierzonych w równych odstępach czasu
+
+```{r 1sec}
+daneH_sekunda <- daneH %>%
+  mutate(
+    datetime_sekunda = round_date(datetime, "second"),
+    wartosc = cena*vol
+  ) %>%
+  group_by(datetime_sekunda) %>%
+  summarise(
+    cena = sum(cena*vol, na.rm=T) / sum(vol, na.rm=T),
+    vol = sum(vol, na.rm=T),
+    wartosc = sum(wartosc, na.rm=T),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  rename(datetime = datetime_sekunda) %>%
+  filter(!is.na(cena), cena>0)
+
+daneL_sekunda <- daneL %>%
+  mutate(
+    datetime_sekunda = round_date(datetime, "second"),
+    wartosc = cena*vol
+  ) %>%
+  group_by(datetime_sekunda) %>%
+  summarise(
+    cena = sum(cena*vol, na.rm=T) / sum(vol, na.rm=T),
+    vol = sum(vol, na.rm=T),
+    wartosc = sum(wartosc, na.rm=T),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  rename(datetime = datetime_sekunda) %>%
+  filter(!is.na(cena), cena>0)
+
+head(daneH_sekunda) %>%
+  kbl(caption="Dane agregowane do sekundy dla spółki H") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+                
+head(daneL_sekunda) %>%
+  kbl(caption="Dane agregowane do sekundy dla spółki L") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+Dokonaliśmy agregacji danych transakcyjnych do danych mierzonych w równych odstępach jednosekundowych. Wszystkie transakcje występujące w tym samym czasie połączyliśmy w jedne, przy czym cena odpowiadająca nowej transakcji została obliczona jako średnia ważona cen poszczególnych transakcji, stosując jako wagi ich wolumeny.
+
+## 1.3. Obliczenie transakcyjnych czasów trwania
+
+```{r calc_dur}
+calculate_durations <- function(df){
+  
+  df$date <- as.Date(df$datetime)
+  
+  df <- df %>%
+    arrange(datetime) %>%
+    group_by(date) %>%
+    mutate(
+      duration = as.numeric(difftime(datetime, lag(datetime, default = NA), units = "secs")) #NA sprawia że pierwsze czasy trwania w sesji które byłyby zerami zostają usunięte
+    ) %>%
+    ungroup()
+  
+  
+  df <- df %>% filter(duration <= 3600)
+  
+  return(df)
+}
+
+daneH_dur <- calculate_durations(daneH_sekunda)
+daneL_dur <- calculate_durations(daneL_sekunda)
+
+head(daneH_dur) %>%
+  kbl(caption="Dane dla spółki L") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+                
+head(daneL_dur) %>%
+  kbl(caption="Dane dla spółki H") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+Dodaliśmy do danych kolumnę z transakcyjnymi czasami trwania (`duration`), przy czym pierwsze transakcje podczas każdej sesji, dla których czas trwania nie ma sensu (wychodziłby o wartości 0), zostały usunięte. Były to 123 obserwacje, co stanowi niecałe 0,1% danych dla spółki H, a ok. 0,15% danych dla spółki L. 
+
+## 1.4. Statystyki opisowe transakcyjnych czasów trwania
+
+```{r desc_stat}
+stats <- function(data, name){
+  stats_df <-  data.frame(
+    Spółka = name,
+    Średnia = as.numeric(mean(data$duration, na.rm = TRUE)),
+    Mediana = as.numeric(median(data$duration, na.rm = TRUE)),
+    `Odch stand.` = as.numeric(sd(data$duration, na.rm = TRUE)),
+    `Wsp zmienności.` = as.numeric(sd(data$duration, na.rm = TRUE)/mean(data$duration, na.rm = TRUE)),
+    Minimum = as.numeric(min(data$duration, na.rm = TRUE)),
+    Maksimum = as.numeric(max(data$duration, na.rm = TRUE)),
+    Skośność = as.numeric(skewness(data$duration, na.rm = TRUE)),
+    Kurtoza = as.numeric(kurtosis(data$duration, na.rm = TRUE)),
+    `Liczba obserwacji` = as.numeric(nrow(data))
+  )
+  
+  return(stats_df)
+}
+
+statsH <- stats(daneH_dur, "Spółka H")
+statsL <- stats(daneL_dur, "Spółka L")
+
+stats_table <- bind_rows(statsH, statsL)
+stats_table_formatted <- stats_table %>%
+  mutate(across(where(is.numeric), ~round(., 2)))
+
+kbl(stats_table_formatted, caption="Statystyki opisowe transakcyjnych czasów trwania") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+***Wnioski:***
+
+1. Intensywność handlu i płynność spółek
+
+  * Spółka H charakteryzuje się wyższą częstotliwością transakcji (127536 obserwacji, a 80325 obserwacji), co wskazuje na wyższą płynność.
+  * Mimo niższej średniej czasu trwania dla spółki H, to patrząc na medianę można dojść do wniosku dominacji krótkich przerw, bo połowa interwałów trwa mniej niż 8 sekund, przy jednoczesnej przeciętnej długości interwału ponad 3-krotnie większym od mediany. W przypadku spółki L ten stosunek to mniej, bo ponad 2.
+
+2. Skrajna prawostronna skośność obu rozkładów
+
+  * Obie spółki wykazują silną dodatnią skośność (dla H: 4,09; dla L: 4,71), co jest typowe dla transakcyjnych czasów trwania.
+  * Mediany, co już wspomniane, osiągają wartości znacznie poniżej średnich.
+  * Wartości maksymalne sugerują skalę sporadycznych długich przerw (na co wskazuje różnica między medianą i średnią)
+  
+3. Ekstremalna kurtoza
+
+  * Obie spółki prezentują bardzo wysokie wartości kurtozy (dla H: 26,92; dla L: 41,57), co wskazuje na:
+    * Nadmierną koncentrację danych w okolicy mediany
+    * Częstsze, niż w rozkładzie normalnym ekstremalne wartości, czyli długie przerwy między transakcjami
+    * Charakterystyczną dla danych rynkowych nadmierną zmienność warunkową.
+  * Wyższa kurtoza spółki L sugeruje większą koncentrację ekstremów, co sprawia, że handel jest mniej regularny niż w przypadku spółki H.
+  
+4. Zmienność i nieciągłość handlu
+
+  * Odchylenie standardowe spółki L jest większe niż spółki H, co przy jednoczesnej większej średniej wskazuje na większą niestabilność tempa transakcji.
+  * Wartości współczynników zmienności (dla H: 1,74; dla L: 1,65) sugerują, że pomimo wyższej bezwzględnej zmienności, spółka L wykazuje bardziej przewidywalny, choć wolniejszy rytm transakcji
+
+## 1.5. Analiza sezonowości śróddziennej
+
+```{r intraday_seasonality}
+calculate_5min_avgs <- function(df){
+  df$interval <- floor_date(df$datetime, "5 minutes")
+  
+  df <- df %>%
+    mutate(interval = if_else(hour(interval) == 16 & minute(interval) == 50,
+           interval - minutes(5),
+           interval))
+  
+  df$time_of_day <- hms::hms(
+    hour = hour(df$datetime),
+    minute = minute(df$datetime),
+    second = second(df$datetime)
+  )
+  
+  interval_avgs <- df %>%
+    mutate(interval_time = format(interval, "%H:%M")) %>%
+    group_by(interval_time) %>%
+    summarise(
+      avg_duration = mean(duration, na.rm=T),
+      n_observations = n()
+      ) %>%
+    ungroup()
+  
+  interval_avgs$time_of_day <- hms::as_hms(paste0(interval_avgs$interval_time, ":00"))
+  
+  return(interval_avgs)
+}
+
+intervals_H <- calculate_5min_avgs(daneH_dur)
+intervals_L <- calculate_5min_avgs(daneL_dur)
+
+intervals_H$Spółka <- "Spółka H"
+intervals_L$Spółka <- "Spółka L"
+combined_intervals <- bind_rows(intervals_H, intervals_L)
+
+ggplot(combined_intervals, aes(x = time_of_day, y=avg_duration, color=Spółka)) +
+  geom_line(size=1) +
+  scale_x_time(breaks = scales::breaks_width("1 hour"), labels = scales::label_time(format = "%H:%M")) +
+  labs(
+    title = "Przekrojowe średnie transakcyjne czasy trwania",
+    subtitle = "Dane w 5-minutowych interwałach czasowych",
+    x = "Pora dnia", 
+    y = "Średni czas trwania (sekundy)",
+    color = "Spółka"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+```
+***Wnioski:***
+
+  * Wykresy sezonowości śróddziennej mają charakterystyczny kształt przybliżony do odwróconej litery U. Na początku sesji oraz przed zamknięciem średnie transakcyjne czasy trwania zarówno dla spółki H jak i spółki L są najkrótsze.
+  * Wzrost średniego czasu trwania do południa spowodowany jest przez mniejszą intensywność handlu w południowych godzinach, wynikłą z przerw obiadowych, czy niższej aktywności instytucjonalnej
+  * Te długie przerwy to główne źródło ekstremalnych obserwacji, które powodują wysoką wartość skośności i kurtozy.
+  * Spadek średniego czasu trwania po południu wynika ze zbliżania się do zamknięcia sesji, wzrostu nacisku transakcyjnego, a także z otwarcia w tych godzinach giełdy amerykańskiej.
+  * Dla spółki L widać wyraźny szczyt około godziny 14:00, dla spółki H, nie aż tak wyraźny w okolicy godziny 13:00.
+  * L przedstawia silniejsze wahania, czyli większą niestabilność w godzinach południowych
+  * Spółka H ma mniejszą amplitudę zmienności od spółki L, bo w okolicy 20s, w porównaniu do 40s. Sugeruje to, że L odznacza się większym wpływem sezonowości na wartości średniego transakcyjnego czasu trwania.
+  * Bez usunięcia sezonowości śróddziennej, analiza danych prowadziłaby do błędnego wniosku, że rynki są bardziej chaotyczne, niż w rzeczywistości.
+
+## 1.5. Usunięcie śróddziennej sezonowości
+
+### Wyznaczenie składowej sezonowej
+
+```{r remove_seasonality}
+prepare_acd_data <- function(df){
+  df %>%
+    #filter(duration > 0) %>% 
+    transmute(
+      durations = duration,
+      time = as.POSIXct(datetime)
+    )%>%
+    group_by(time) %>%
+    summarise(durations = sum(durations), .groups = "drop")
+}
+
+daneH_pre <- prepare_acd_data(daneH_dur)
+daneL_pre <- prepare_acd_data(daneL_dur)
+
+
+remove_season <- function(df) {
+  adj <- diurnalAdj(
+    dur = df,
+    method = "FFF",
+    aggregation = "weekdays",
+    Q = 3
+  )
+  df <- df %>%
+    mutate(
+      adjDur = adj$adjDur,
+      seasonal = durations / adjDur,
+      weekday = wday(time, label = TRUE)
+    )
+  return(df)
+}
+
+
+daneH_adj <- remove_season(daneH_pre)
+daneL_adj <- remove_season(daneL_pre)
+```
+Wyznaczyliśmy szacowane, dzienne składowe sezonowe metodą za pomocą elastycznej formy Fouriera dla spółki H i L, dla każdego z dni tygodnia (w trakcie których aktywna jest giełda).
+
+***Wnioski:***
+
+Spółka H:
+
+1. Poniedziałek:
+
+  * Wzór: Wyraźny szczyt w godzinach 13:00–14:00 (do ponad 50 sekund), z głębokim spadkiem w godzinach 09:00–10:00 (do 20–25 sekund).
+  * Interpretacja:
+    * Najwyższa sezonowa niepłynność w południowych godzinach (największe czasy trwania), spowodowane najpewniej niską aktywnością uczestników rynku na początku tygodnia, np. powrót do pracy po weekendzie, opóźnione podejmowanie decyzji.
+    * Wysoka płynność rano (najkrótsze czasy trwania) jest typowa dla otwarcia sesji, kiedy inwestorzy aktywnie dostosowują pozycje po weekendzie.
+
+2. Wtorek:
+
+  * Wzór: Mniej wyraźny szczyt w godzinach 13:00–14:00 (do 40 sekund), z delikatnym spadkiem w godzinach 09:00–10:00.
+  * Interpretacja:
+    * Mniejsza niestabilność niż w poniedziałek, co znaczy, że rynek budzi się po pierwszym dniu tygodnia.
+    * Regularny spadek aktywności w południe, ale mniej ekstremalny niż w poniedziałek, sugeruje stabilniejsze zachowanie uczestników, np. mniejsze wahania w podejmowaniu decyzji.
+
+3. Środa:
+
+  * Wzór: Podwójny szczyt – pierwszy około 12:00 (do 40 sekund), drugi w 13:00–14:00 (do 45 sekund).
+  * Interpretacja:
+    * Dwustopniowy spadek płynności może wynikać z specyfiki śródtygodniowej aktywności.
+    * Najbardziej nieregularny wzór wskazuje na większą zmienność zachowań uczestników w trakcie tygodnia (np. mniej strukturalnych wzorców handlu).
+
+4. Czwartek:
+
+  * Wzór: Szczyt w godzinach 13:00–14:00 (do 40 sekund), z gwałtownym spadkiem po 15:00.
+  * Interpretacja:
+    * Regularny rytm podobny do wtorku, ale z silniejszym przyspieszeniem aktywności w drugiej połowie dnia (spadek czasu trwania po 15:00).
+    * Wzrost płynności przed zamknięciem sesji jest typowy dla zbliżania się do końca tygodnia (uczestnicy redukują pozycje).
+
+5. Piątek:
+
+  * Wzór: Szczyt wcześniejszy (w godzinach 12:00–13:00), z mocnym spadkiem po 14:00.
+  * Interpretacja:
+    * Najwyższa płynność w drugiej połowie dnia, bo uczestnicy aktywnie zamykają pozycje przed weekendem.
+    * Mniejszy szczyt w południe niż w poniedziałek, bo rynek jest mniej podatny na zastój (np. z powodu mniejszej niepewności).
+
+Spółka L:
+
+1. Poniedziałek:
+
+  * Wzór: Wyraźny szczyt w godzinach 11:00–12:00 (poniżej 60 sekund), z niskim poziomem aktywności rano (40–45 sekund w godzinach 09:00–10:00).
+  * Interpretacja:
+    * Najwyższa sezonowa niepłynność w godzinach 11:00–12:00 sugeruje niską aktywność uczestników rynku na początku tygodnia (np. opóźnione reakcje na informacje z weekendu, mniejsza dostępność instytucjonalnych inwestorów).
+    * Niskie czasy trwania rano (40–45 sekund) wskazują na względnie wysoką płynność przy otwarciu sesji, ale szybki spadek aktywności w godzinach 10:00–11:00.
+
+2. Wtorek:
+
+  * Wzór: Szczyt w godzinach 13:00–14:00 (do 70 sekund), ze stromym spadkiem po godzinie 14:00.
+  * Interpretacja:
+    * Mniej regularny rytm, mimo że podobny do poniedziałku, ale z bardziej stromym wykresem
+    * Najbardziej ekstremalny zastój w południe, spowodowany niską aktywnością handlową, jednak szczególnie wyraźny na tle tygodnia.
+
+3. Środa:
+
+  * Wzór: Podwójny wzór, pik w dół około 10:00 (do 35 sekund), a następnie szczyt w godzinach 13:00–14:00 (około 50 sekund).
+  * Interpretacja:
+    * Krótkotrwały wzrost aktywności około 10:00 może wynikać z komunikacji między uczestnikami, zauważyć można go też w wykresie środowym dla spółki H.
+    * Silny zastój w południe – podobnie jak w poniedziałek, ale z mniejszą amplitudą, co wskazuje na mniejszą niestabilność niż w pierwszym dniu tygodnia.
+
+4. Czwartek:
+
+  * Wzór: Szczyt około 13:00 (ponad 60 sekund), z gwałtownym spadkiem po 15:00.
+  * Interpretacja:
+    * Regularny rytm podobny do wtorku, z mniejszym szczytem, ale z wyraźnym przyśpieszeniem aktywności w drugiej połowie dnia (spadek czasu trwania po 15:00).
+    * Wzrost płynności przed zamknięciem sesji, co typowe dla zbliżania się do końca tygodnia (uczestnicy redukują pozycje).
+
+5. Piątek:
+
+  * Wzór: Niewielka stałość czasów trwania od 10:00 do 11:00, następnie wcześniejszy i dłużej trwający szczyt (w godzinach 12:00–14:00), z drastycznym spadkiem po 14:00.
+  * Interpretacja:
+    * Najwyższa płynność w drugiej połowie dnia – uczestnicy aktywnie zamykają pozycje przed weekendem.
+    * Wyższy szczyt w południe niż w poniedziałek – rynek jest bardziej podatny na zastój, być może z powodu końcówki tygodnia.
+
+Dla wszystkich wykresów szczyty znajdują się w okolicy 13:00, z powodu efektu lunchu, a po godzinie 15:00 zaliczają gwałtowny pik w dół z powodu otwarcia giełdy amerykańskiej, a także zbliżania się do końca sesji.
+
+
+### Weryfikacja skuteczności usuwania sezonowości
+
+```{r}
+aggregate_adj <- function(df, nazwa) {
+  df %>%
+    mutate(
+      day_minute = hour(time)*60 + minute(time),
+      interval_5min = floor((day_minute - 9*60)/5) + 1,
+      interval_5min = ifelse(interval_5min > 94, 94, interval_5min)
+    ) %>%
+    group_by(interval_5min) %>%
+    summarise(
+      mean_time_adj = mean(adjDur, na.rm = TRUE)
+    ) %>%
+    mutate(Spółka = nazwa)
+}
+
+daneH_agg_season <- aggregate_adj(daneH_adj, "Spółka H")
+daneL_agg_season <- aggregate_adj(daneL_adj, "Spółka L")
+#results <- rbind(daneH_agg_season, daneL_agg_season)
+
+labelsx <- c("09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "16:50")
+posH <- seq(1, max(daneH_agg_season$interval_5min), length.out = length(labelsx))
+posL <- seq(1, max(daneL_agg_season$interval_5min), length.out = length(labelsx))
+
+ggplot(daneH_agg_season, aes(x = interval_5min, y = mean_time_adj, color= "H")) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_x_continuous(breaks = posH, labels = labelsx) +
+  labs(
+    title = "Przekrojowe transakycjne średnie czasów trwania po us. sezonowości spółki H",
+    x = "Godzina sesji",
+    y = "Średni czas trwania (adjDur)",
+    color = "Spółka"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggplot(daneL_agg_season, aes(x = interval_5min, y = mean_time_adj, color= "L")) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_x_continuous(breaks = posL, labels = labelsx) +
+  labs(
+    title = "Przekrojowe transakycjne średnie czasów trwania po us. sezonowości spółki L",
+    x = "Godzina sesji",
+    y = "Średni czas trwania (adjDur)",
+    color = "Spółka"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+***Analiza wykresów:***
+
+* Wartość oczekiwana wokół 1: Na obu wykresach (dla spółki H i L) widać, że proces oscyluje wokół jedynki. To sygnał, że model sezonowości poprawnie estymuje „normę” dla danej godziny. Jeśli wartość wynosi 1, transakcja nastąpiła dokładnie w tempie, jakiego spodziewalibyśmy się o tej porze.
+* Dla obu spółek większość odczytów mieści się w przedziale 0.8 – 1.2. Oznacza to, że po usunięciu trendu dobowego, zmienność (szum lub reakcje na newsy) jest relatywnie podobna dla obu podmiotów, mimo że ich bazowa płynność jest różna
+* Spółka H wydaje się mieć większe skoki i spadki w wartości niż spółka L.
+
+***Wnioski:***
+
+Zabieg usunięcia sezonowości można uznać za udany z następujących powodów:
+
+* Eliminacja "garbu": Charakterystyczne wybrzuszenie w środku dnia całkowicie zniknęło. Wykresy przypominają teraz błądzenie losowe wokół wartości 1, zamiast funkcji wypukłej.
+
+* Porównywalność: Dzięki sprowadzeniu danych do indeksu (adjDur), możemy teraz bezpośrednio porównywać dynamikę spółki H i L. Wcześniej było to trudne, bo różnica w „sekundach” zacierała obraz relatywnych skoków aktywności.
+
+* Na końcach sesji (tuż przed 17:00) oraz na początku sesji (9:00) na obu wykresach po usunięciu sezonowości widać gwałtowne piki w dół. To wynik ogromnej zmienności, której nawet standardowe modele sezonowości nie zawsze są w stanie wygładzić w idealny sposób.
+
+
+# 2. Analiza cenowych czasów trwania i modelowanie ACD/LACD
+
+## 2.1. Wyznaczenie progu na podstawie wartości ticku dla konkretnej spółki
+
+Zgodnie z teorią mikrostruktury rynku, czas trwania ceny definiujemy jako odstęp czasu pomiędzy momentami, w których dochodzi do skumulowanego wzrostu lub spadku ceny danego instrumentu o ustaloną wartość progową p0. Przed przystąpieniem do obliczeń, przypomnijmy ważną uwagę z wykładu:
+
+"Przyjęcie konkretnej wartości progowej p0 determinuje własności uzyskanego procesu czasu trwania ceny. Zwykle przyjmuje się p0 jako kilku- lub kilkunastokrotność tiku cenowego."
+
+### Obliczenia na szeregu agregowanym do jednej sekundy
+
+```{r ticks_sec}
+old_scipen <- getOption("scipen")
+options(scipen = 9999999)
+
+clean_tick <- function(cena){
+  cena <- round(cena, 6)
+  roznice <- abs(diff(sort(unique(cena))))
+  return(median(roznice))
+}
+
+tick_priceH <- round(clean_tick(daneH_sekunda$cena), 6)
+tick_priceL <- round(clean_tick(daneL_sekunda$cena), 6)
+progH <- 15*tick_priceH
+progL <- 15*tick_priceL
+
+print(paste("Mediana ticków cenowych dla spółki H:", tick_priceH))
+print(paste("Sugerowany próg cenowy dla spółki H:", progH, "(15-krotność ticku)"))
+
+print(paste("Mediana ticków cenowych dla spółki L:", tick_priceL))
+print(paste("Sugerowany próg cenowy dla spółki L:", progL, "(15-krotność ticku)"))
+```
+
+W wyniku agregacji danych transakcyjnych do danych mierzonych w równych odstępach jednosekundowych otrzymaliśmy szereg cenowy o wysokiej precyzji, bo aż do 6 miejsc po przecinku. Progi cenowe nie mogą być jednak tak niskie, bo ruchy na poziomie setnych części grosza nie mają znaczenia ekonomicznego, a wprowadzają do obliczeń szum mikrostruktury rynku. Progi cenowe przyjmiemy zatem zgodne z krokiem notowań danych przed agregacją (1 gr).
+Dla weryfikacji zasadności takiego działania przeprowadzimy powyższe obliczenia dla danych przed agregacją
+
+### Obliczenia na szeregu przed agregacją
+
+```{r tics_oryg}
+tick_priceH <- round(clean_tick(daneH$cena), 6)
+tick_priceL <- round(clean_tick(daneL$cena), 6)
+
+print(paste("Mediana ticków cenowych dla spółki H:", tick_priceH))
+print(paste("Sugerowany zakres progu cenowego dla spółki H: [", 10*tick_priceH, ";", 20*tick_priceH, "] (od 10-krotności do 20-krotności ticku)"))
+
+print(paste("Mediana ticków cenowych dla spółki L:", tick_priceL))
+print(paste("Sugerowany zakres progu cenowego dla spółki L: [", 10*tick_priceL, ";", 20*tick_priceL, "] (od 10-krotności do 20-krotności ticku)"))
+```
+
+## 2.2. Konstrukcja szeregów czasowych cenowych czasów trwania
+
+Na podstawie powyższej analizy, skonstruujemy dla obu spółek szeregi czasowe cenowych czasów trwania, przyjmując progi: 0.01 zł, 0.02 zł, 0.05 zł.
+
+
+```{r price_duration_series}
+
+calculate_price_durations <- function(df, p0) {
+  df <- df %>% arrange(datetime) %>% mutate(date = as.Date(datetime))
+  
+  #lista na wyniki dla każdego dnia osobno (żeby nie mieszać sesji)
+  results_list <- list()
+  
+  days <- unique(df$date)
+  
+  for (d in as.character(days)) {
+    day_data <- df[df$date == d, ]
+    n <- nrow(day_data)
+    
+    #wektory na wyniki
+    keep <- logical(n)
+    
+    #punkt startowy: pierwsza transakcja dnia zawsze inicjuje proces
+    keep[1] <- TRUE
+    last_price <- day_data$cena[1]
+    
+    for (i in 2:n) {
+      if (abs(day_data$cena[i] - last_price) >= p0) {
+        keep[i] <- TRUE
+        last_price <- day_data$cena[i]
+      }
+    }
+    
+    # Filtrujemy tylko te momenty, gdzie p0 zostało przekroczone
+    day_results <- day_data[keep, ]
+    
+    # Liczymy duration między filtrowanymi momentami
+    day_results <- day_results %>%
+      mutate(
+        duration = as.numeric(difftime(datetime, lag(datetime, default = datetime[1]), units = "secs"))
+      )
+    
+    results_list[[d]] <- day_results
+  }
+  
+  final_df <- bind_rows(results_list)
+  return(final_df)
+}
+```
+
+```{r pds_obliczenia}
+
+# Obliczenie czasów trwania dla obu spółek i obu progów
+# Dla Spółki H
+durations_H_p01 <- calculate_price_durations(daneH_sekunda, 0.01)
+durations_H_p02 <- calculate_price_durations(daneH_sekunda, 0.02)
+durations_H_p05 <- calculate_price_durations(daneH_sekunda, 0.05)
+
+# Dla Spółki L
+durations_L_p01 <- calculate_price_durations(daneL_sekunda, 0.01)
+durations_L_p02 <- calculate_price_durations(daneL_sekunda, 0.02)
+durations_L_p05 <- calculate_price_durations(daneL_sekunda, 0.05)
+
+# Informacje o liczbie obserwacji
+cat("Czasy trwania ceny dla Spółki H:\n")
+cat("- Próg 0,01 zł:", nrow(durations_H_p01), "obserwacji\n")
+cat("- Próg 0,02 zł:", nrow(durations_H_p02), "obserwacji\n")
+cat("- Próg 0,05 zł:", nrow(durations_H_p05), "obserwacji\n\n")
+
+cat("Czasy trwania ceny dla Spółki L:\n")
+cat("- Próg 0,01 zł:", nrow(durations_L_p01), "obserwacji\n")
+cat("- Próg 0,02 zł:", nrow(durations_L_p02), "obserwacji\n")
+cat("- Próg 0,05 zł:", nrow(durations_L_p05), "obserwacji\n")
+
+# Dodanie informacji o dniu tygodnia dla późniejszej analizy
+add_weekday_info <- function(df) {
+  df$day_of_week <- wday(df$datetime, label = TRUE, abbr = FALSE, week_start = 1)
+  return(df)
+}
+
+durations_H_p01 <- add_weekday_info(durations_H_p01)
+durations_H_p02 <- add_weekday_info(durations_H_p02)
+durations_H_p05 <- add_weekday_info(durations_H_p05)
+
+durations_L_p01 <- add_weekday_info(durations_L_p01)
+durations_L_p02 <- add_weekday_info(durations_L_p02)
+durations_L_p05 <- add_weekday_info(durations_L_p05)
+
+
+
+usuwanie_zer <- function(df){
+  df_cleaned <- df %>%
+    arrange(datetime) %>%         # Porządek chronologiczny
+    group_by(as.Date(datetime)) %>% # Grupowanie po dacie
+    filter(duration > 0) %>%      # Usuwanie zer (pierwszych wpisów i ewentualnych błędów)
+    ungroup() %>%
+    select(-`as.Date(datetime)`)   # Usunięcie tymczasowej kolumny grupującej
+  
+  return(df_cleaned)
+}
+
+durations_H_p01 <- usuwanie_zer(durations_H_p01)
+durations_H_p02 <- usuwanie_zer(durations_H_p02)
+durations_H_p05 <- usuwanie_zer(durations_H_p05)
+
+durations_L_p01 <- usuwanie_zer(durations_L_p01)
+durations_L_p02 <- usuwanie_zer(durations_L_p02)
+durations_L_p05 <- usuwanie_zer(durations_L_p05)
+
+
+plot_dynamic_duration_hist <- function(df, title) {
+  #Obliczamy punkt odcięcia (90% danych zostanie na wykresie)
+  #To eliminuje bardzo długie czasy trwania, które ściskają histogram do lewej
+  x_limit <- quantile(df$duration, 0.9, na.rm = TRUE)
+  
+  #Dynamiczne dobieranie kroku etykiet (breaks)
+  #Chcemy mieć ok. 10 etykiet na osi
+  break_step <- round(x_limit / 10)
+  if(break_step == 0) break_step <- 1 #Zabezpieczenie dla bardzo krótkich szeregów
+  
+  ggplot(df, aes(x = duration)) +
+    geom_histogram(
+      aes(y = after_stat(count)), 
+      binwidth = max(1, round(x_limit/50)), #Szerokość słupka dostosowana do zakresu
+      fill = "steelblue", 
+      color = "white",
+      alpha = 0.8
+    ) +
+    
+    #Dynamiczne ograniczenie osi X
+    coord_cartesian(xlim = c(0, x_limit)) +
+    scale_x_continuous(breaks = seq(1, x_limit, by = break_step)) +
+    labs(
+      title = title,
+      subtitle = paste("Zakres ograniczony do kwantyla 0.9 (widoczne zdarzenia do", round(x_limit), "sek.)"),
+      x = "Czas trwania (sekundy)",
+      y = "Liczba zdarzeń"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid.minor = element_blank()
+    )
+}
+
+
+plot_dynamic_duration_hist(durations_H_p01, "Spółka H – próg 0,01 zł")
+plot_dynamic_duration_hist(durations_H_p02, "Spółka H – próg 0,02 zł")
+plot_dynamic_duration_hist(durations_H_p05, "Spółka H – próg 0,05 zł")
+
+
+plot_dynamic_duration_hist(durations_L_p01, "Spółka L – próg 0,01 zł")
+plot_dynamic_duration_hist(durations_L_p02, "Spółka L – próg 0,02 zł")
+plot_dynamic_duration_hist(durations_L_p05, "Spółka L – próg 0,05 zł")
+
+```
+
+Liczba obserwacji dla różnych wartości progu w czasach trwania ceny dla spółek H i L, a także analiza kształtu histogramów potwierdzają wcześniejsze obliczenia sugerowanych zakresów progów.
+
+Dla Spółki H próg 0,01 zł generuje ogromną liczbę obserwacji (ponad 11 tysięcy). To sugeruje, że ta spółka "żyje" na poziomie pojedynczych groszy. świadczy to o jej płynności i gęstości arkusza zleceń. Przy 11 tys. obserwacji dla 1 grosza, histogram jest zdominowany przez mikroszum i transakcje o czasie 1 sekundy. Próg 0,05 zł to dobry kompromis: 654 obserwacje wystarczają do obliczenia statystyk, ale odcinają szum i pokazują realne ruchy ceny.
+
+Spółka L przy progu 5 groszy ma tylko 161 obserwacji. To za mało, żeby budować zaawansowane modele (np. ACD), bo po podziale na dni wyjdzie zaledwie kilka zdarzeń na sesję. W tym przypadku Próg 0,02 zł to złoty środek: 679 obserwacji wystarczy do obliczenia statystyk, a zarazem odcina szum i pokazuje realne ruchy ceny. Przy tym unikamy rozkładu składającego się z dziur, jak przy progu 5 gr.
+
+Do dalszych obliczeń oraz realizacji pozostałych poleceń wybierzemy wspólny dla obu spółek próg 0,02 zł. Dla spółki L jest to dobry wybór z powodów wymienionych w poprzednim akapicie, zaś dla spółki H jest wystarczająco dobry, bo nie generuje aż tak dużej liczby obserwacji jak próg 0,01 zł, bo tylko 3678. Unikamy przy tym szumu związanego z jednogroszowym progiem.
+
+
+## 2.3. Statystyki opisowe wspólnego progu
+
+Dla porównania obu spółek, przyjmiemy wspólny próg 0,01 zł. Wyniki przedstawiamy w tabeli:
+
+```{r descriptive_statistics_price_duration}
+# Funkcja obliczająca statystyki opisowe
+get_price_duration_stats <- function(data, company_name, threshold) {
+  data.frame(
+    Spółka = company_name,
+    `Próg (zł)` = threshold,
+    Średnia = mean(data$duration, na.rm = TRUE),
+    Mediana = median(data$duration, na.rm = TRUE),
+    `Odch stand.` = sd(data$duration, na.rm = TRUE),
+    `Wsp zmienności` = as.numeric(sd(data$duration, na.rm = TRUE)/mean(data$duration, na.rm = TRUE)),
+    Minimum = min(data$duration, na.rm = TRUE),
+    Maksimum = max(data$duration, na.rm = TRUE),
+    Skośność = skewness(data$duration, na.rm = TRUE),
+    Kurtoza = kurtosis(data$duration, na.rm = TRUE),
+    `Liczba obserwacji` = nrow(data)
+  )
+}
+
+# Obliczenie statystyk dla progu 0,01 zł
+stats_H_p02 <- get_price_duration_stats(durations_H_p02, "Spółka H", 0.02)
+stats_L_p02 <- get_price_duration_stats(durations_L_p02, "Spółka L", 0.02)
+
+# Połączenie wyników
+stats_table_p02 <- bind_rows(stats_H_p02, stats_L_p02)
+
+# Formatowanie tabeli
+stats_table_p02_formatted <- stats_table_p02 %>%
+  mutate(across(where(is.numeric), ~ round(., 2)))
+
+knitr::kable(stats_table_p02_formatted, caption = "Statystyki opisowe cenowych czasów trwania dla progu 0,02 zł", digits = 2)
+```
+
+Analiza statystyk opisowych cenowych czasów trwania (price durations) dla spółek H i L przy progu zmiany ceny o 0,02 zł pozwala na wyciągnięcie istotnych wniosków dotyczących dynamiki handlu i płynności obu walorów:
+
+1. Częstotliwość i płynność (liczba obserwacji)
+  * Spółka H (3555 obserwacji) generuje znacznie więcej zdarzeń cenowych niż Spółka L (556 obserwacji) w tym samym badanym okresie.
+  * Wniosek: Spółka H charakteryzuje się znacznie wyższą dynamiką zmian cen. Próg 0,02 zł jest przekraczany ponad 6-krotnie częściej niż w przypadku spółki L, co sugeruje wyższą płynność i większą aktywność transakcyjną na arkuszu zleceń spółki H.
+  
+2. Średni czas oczekiwania (średnia i mediana)
+  * Spółka H: Średni czas potrzebny na zmianę ceny o 0,02 zł to ok. 925 jednostek czasu, przy czym mediana jest znacznie niższa (351).
+  * Spółka L: Średni czas jest ponad 4-krotnie dłuższy (4118), a mediana wynosi 2048.
+  * Wniosek: W spółce L cena „stoi w miejscu” znacznie dłużej. Co ważne, w obu przypadkach średnia jest dużo wyższa od mediany, co jest typowe dla rozkładów czasów trwania i wskazuje na asymetrię prawostronną (występowanie nielicznych, ale bardzo długich okresów bez zmian ceny).
+  
+3. Zmienność i rozproszenie
+  * Współczynnik zmienności: Jest wyższy dla spółki H (1,77) niż dla L (1,27).
+  * Wniosek: Mimo że spółka H reaguje szybciej, jej czasy trwania są mniej stabilne (relatywnie bardziej rozproszone wokół średniej). Wartości większe od 1 sugerują, że rozkłady nie są wykładnicze (co jest standardem w finansach) i wykazują cechy tzw. „nadmiernej zmienności” (overdispersion).
+  
+4. Charakterystyka rozkładu (skośność i kurtoza)
+To tutaj widać najbardziej radykalne różnice:
+
+  * Skośność: Dla spółki H wynosi 4,31 (bardzo silna asymetria prawostronna), dla spółki L 2,06 (umiarkowana).
+  * Kurtoza: W spółce H mamy do czynienia z ekstremalnie wysoką kurtozą (26,24), podczas gdy w spółce L jest ona relatywnie niska (4,07).
+  * Interpretacja:
+    - Rozkład spółki H jest leptokurtyczny w stopniu ekstremalnym. Oznacza to bardzo silną koncentrację wokół krótkich czasów trwania (szybkie zmiany ceny jedna po drugiej), ale jednocześnie występowanie tzw. „grubych ogonów” – rzadkich, ale ekstremalnie długich przerw w aktywności cenowej (maksimum dla H to 18390).
+    - Spółka L ma rozkład bardziej „płaski” i przewidywalny w porównaniu do H, choć jej maksymalny czas trwania jest wyższy (28189), co wynika z jej ogólnie niższej płynności.
+
+## 2.4. Wykresy przekrojowych średnich dla dwóch progów
+
+Wybraliśmy przedziały czasowe 5-minutowe oraz progi 0,01 zł i 0,02 zł. Nie braliśmy pod uwagę progu 0,05 zł, ponieważ jak widać było na histogramie spółki L, ten był poszarpany, bo liczba obserwacji była zbyt niska.
+
+```{r intraday_averages_price_duration}
+# Funkcja obliczająca przekrojowe średnie w 5-minutowych interwałach
+calculate_intraday_averages <- function(durations_df) {
+  interval_averages <- durations_df %>%
+    # 1. Tworzymy interwały 5-minutowe bezpośrednio z datetime
+    mutate(
+      interval = floor_date(datetime, "5 minutes"),
+      # 2. Wyciągamy samą godzinę (HH:MM:SS), ignorując datę, aby móc liczyć średnią przekrojową (ze wszystkich dni)
+      interval_time = hms::as_hms(format(interval, "%H:%M:%S"))
+    ) %>%
+    # 3. Grupujemy po porze dnia
+    group_by(interval_time) %>%
+    summarise(
+      avg_duration = mean(duration, na.rm = TRUE),
+      count = n(),
+      .groups = "drop"
+    ) %>%
+    arrange(interval_time)
+  
+  return(interval_averages)
+}
+
+# Obliczenie średnich dla obu spółek i progów
+# Spółka H
+intraday_H_p01 <- calculate_intraday_averages(durations_H_p01)
+intraday_H_p01$threshold <- "0,01 zł"
+intraday_H_p01$company <- "Spółka H"
+
+intraday_H_p02 <- calculate_intraday_averages(durations_H_p02)
+intraday_H_p02$threshold <- "0,02 zł"
+intraday_H_p02$company <- "Spółka H"
+
+# Spółka L
+intraday_L_p01 <- calculate_intraday_averages(durations_L_p01)
+intraday_L_p01$threshold <- "0,01 zł"
+intraday_L_p01$company <- "Spółka L"
+
+intraday_L_p02 <- calculate_intraday_averages(durations_L_p02)
+intraday_L_p02$threshold <- "0,02 zł"
+intraday_L_p02$company <- "Spółka L"
+
+# Wykres dla Spółki H
+ggplot_H <- ggplot(bind_rows(intraday_H_p01, intraday_H_p02),
+                  aes(x = interval_time, y = avg_duration, color = threshold)) +
+  geom_line(size = 1.2) +
+  scale_x_time(breaks = scales::breaks_width("1 hour"), 
+               labels = scales::label_time(format = "%H:%M")) +
+  labs(
+    title = "Przekrojowe średnie cenowych czasów trwania dla Spółki H",
+    subtitle = "W 5-minutowych interwałach czasowych",
+    x = "Czas dnia", 
+    y = "Średni czas trwania (sekundy)",
+    color = "Próg cenowy"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+
+# Wykres dla Spółki L
+ggplot_L <- ggplot(bind_rows(intraday_L_p01, intraday_L_p02),
+                  aes(x = interval_time, y = avg_duration, color = threshold)) +
+  geom_line(size = 1.2) +
+  scale_x_time(breaks = scales::breaks_width("1 hour"), 
+               labels = scales::label_time(format = "%H:%M")) +
+  labs(
+    title = "Przekrojowe średnie cenowych czasów trwania dla Spółki L",
+    subtitle = "W 5-minutowych interwałach czasowych",
+    x = "Czas dnia", 
+    y = "Średni czas trwania (sekundy)",
+    color = "Próg cenowy"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+
+# Wyświetlenie obu wykresów
+ggplot_H
+ggplot_L
+```
+
+Te dwa wykresy dają świetny wgląd w to, jak płynność spółki wpływa na tzw. cenowe czasy trwania (price durations). O ile poprzednio analizowaliśmy czasy między transakcjami, tutaj patrzymy na czas, jaki musi upłynąć, aby cena zmieniła się o określoną wartość (0,01 zł lub 0,02 zł).
+
+1. Skala i płynność
+
+To pierwszy element, który rzuca się w oczy i definiuje obie spółki:
+
+  * Spółka H: Oś Y kończy się na ok. 2500–3000 sekund. Zmiana ceny o 2 grosze zajmuje tu średnio od 15 do 40 minut w ciągu dnia.
+
+  * Spółka L: Oś Y sięga aż 15 000 sekund. Oznacza to, że w okresach mniejszej płynności (środek dnia), na zmianę ceny o 0,02 zł trzeba czekać nawet 4 godziny.
+
+  * Wniosek: Spółka L jest drastycznie mniej płynna. Cena zatrzymuje się na jednym poziomie na znacznie dłużej niż w przypadku spółki H.
+
+2. Wpływ progu cenowego (0,01 zł, a 0,02 zł)
+
+Na obu wykresach widać, że zależność między progiem a czasem trwania nie jest liniowa:
+
+  * Nieliniowy skok: Podwojenie progu (z 1 gr na 2 gr) powoduje znacznie więcej niż podwojenie czasu oczekiwania. Widać to szczególnie u Spółki L, gdzie linia niebieska (0,02 zł) "odlatuje" od czerwonej, tworząc ogromne piki.
+
+  * Stabilność 1 gr: Dla progu 0,01 zł obie spółki zachowują się relatywnie stabilnie (w swoich skalach). Sugeruje to, że mniejsze zmiany ceny są realizowane w miarę płynnie przez mniejsze zlecenia.
+
+3. Sezonowość śróddzienna
+
+Oba wykresy potwierdzają klasyczny wzorzec aktywności rynkowej:
+
+  * Poranek (09:00): Czasy trwania są najniższe (bliskie zeru). Rynek jest gorący, zlecenia wpadają szybko, cena dynamicznie szuka punktu równowagi.
+
+  * Efekt lunchu (12:00–14:00): Wyraźne wybrzuszenie (wzrost czasu trwania). To czas, kiedy "duzi gracze" jedzą obiad, a zmienność ceny zamiera. U Spółki L ten efekt jest ekstremalny i bardzo rwany.
+
+  * Zamknięcie (16:00–17:00): Ponowny spadek czasu trwania – zwiększona aktywność przed fixingiem zamknięcia powoduje szybsze przeskoki ceny.
+
+
+## 2.4. Modelowanie ACD/LACD dla minimalnego progu
+
+Zgodnie z wykładem:
+
+"Przed przystąpieniem do modelowania czasów trwania konieczne jest wcześniejsze usunięcie efektu śróddziennej cykliczności."
+
+### 2.4.1. Przygotowanie danych
+
+Najpierw usuwamy śróddzienną sezonowość dla minimalnego progu (0,01 zł):
+
+```{r acd_model_preparation}
+
+prepare_data <- function(df){
+  df %>%
+    filter(duration > 0) %>%
+    transmute(
+      durations = duration,
+      time = as.POSIXct(datetime)
+    )%>%
+    group_by(time) %>%
+    summarise(durations = sum(durations), .groups = "drop")
+}
+
+# Selekcja danych dla minimalnego progu (0,01 zł)
+# Spółka H
+durations_H_min <- durations_H_p01 %>%
+  mutate(datetime = as.POSIXct(datetime))
+
+# Spółka L
+durations_L_min <- durations_L_p01 %>%
+  mutate(datetime = as.POSIXct(datetime))
+
+# Przygotowanie danych
+durH_pre <- prepare_data(durations_H_min)
+durL_pre <- prepare_data(durations_L_min)
+
+# Usunięcie śróddziennej sezonowości
+remove_season1 <- function(df) {
+  adj <- diurnalAdj(
+    dur = df,
+    method = "FFF",
+    aggregation = "weekdays",
+    Q = 3
+  )
+  df <- df %>%
+    mutate(
+      adjDur = adj$adjDur,
+      seasonal = durations / adj$adjDur,
+      weekday = wday(time, label = TRUE)
+    )
+  return(df)
+}
+
+# Usunięcie sezonowości dla obu spółek
+daneH_adj_c <- remove_season1(daneH_pre)
+daneL_adj_c <- remove_season1(daneL_pre)
+
+
+get_seasonality_averages <- function(df) {
+  
+  # A. Tworzenie 5-minutowych interwałów (zachowuje datę)
+  df$interval <- floor_date(df$time, "5 minutes")
+  
+  # B. KLUCZOWE: Ekstrakcja samego czasu (spłaszcza dni do jednej doby)
+  df$interval_time <- hms::as_hms(df$interval)
+  
+  # C. Obliczenie średnich dla obu typów danych (surowe i odsezonowane)
+  interval_avgs <- df %>%
+    group_by(interval_time) %>%
+    summarise(
+      avg_raw = mean(durations, na.rm = TRUE),    # Dane przed (surowe)
+      avg_adj = mean(adjDur, na.rm = TRUE),     # Dane po (odsezonowane)
+      count = n()
+    ) %>%
+    ungroup()
+  
+  return(interval_avgs)
+}
+
+plot_data_H <- get_seasonality_averages(daneH_adj_c)
+plot_data_L <- get_seasonality_averages(daneL_adj_c)
+
+make_plot <- function(data, y_col, title_text, y_lab, color_hex, add_ref_line = FALSE) {
+  
+  p <- ggplot(data, aes(x = interval_time, y = .data[[y_col]])) +
+    geom_line(size = 1.2, color = color_hex) +
+    scale_x_time(breaks = scales::breaks_width("2 hours"), 
+                 labels = scales::label_time(format = "%H:%M")) +
+    labs(
+      title = title_text,
+      x = NULL, # Usuwam 'Czas dnia' żeby nie dublować w siatce
+      y = y_lab
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(size = 10, face = "bold"))
+  
+  if(add_ref_line) {
+    p <- p + geom_hline(yintercept = 1, linetype = "dashed", color = "gray40")
+  }
+  
+  return(p)
+}
+
+#Spółka H
+p1_H_raw <- make_plot(plot_data_H, "avg_raw", "Spółka H: Przed (Surowe)", "Sekundy", "#F8766D", FALSE)
+p2_H_adj <- make_plot(plot_data_H, "avg_adj", "Spółka H: Po (Odsezonowane)", "Indeks", "#00BFC4", TRUE)
+
+#Spółka L
+p3_L_raw <- make_plot(plot_data_L, "avg_raw", "Spółka L: Przed (Surowe)", "Sekundy", "#F8766D", FALSE)
+p4_L_adj <- make_plot(plot_data_L, "avg_adj", "Spółka L: Po (Odsezonowane)", "Indeks", "#00BFC4", TRUE)
+
+
+grid.arrange(
+  p1_H_raw, p2_H_adj,
+  p3_L_raw, p4_L_adj,
+  ncol = 2,
+  top = "Weryfikacja usuwania sezonowości (Agregacja 5-min)"
+)
+```
+
+Wyznaczyliśmy szacowane, dzienne składowe sezonowe metodą elastycznej formy Fouriera dla spółki H i L, analizując cenowe czasy trwania (czas potrzebny na zmianę ceny o zadany próg) dla każdego z dni tygodnia.
+
+***Wnioski:***
+
+Spółka H:
+
+1. Poniedziałek:
+
+  * Wzór: Wyraźny szczyt bezwładności cenowej w godzinach 13:00–14:00 (czas oczekiwania na zmianę ceny wzrasta do ponad 50 sekund), z najszybszymi zmianami kursu rano 09:00–10:00 (20–25 sekund).
+
+  * Interpretacja: Największa sezonowa „sztywność” cen w południe, wynikająca z niskiej presji transakcyjnej po weekendzie. Wysoka dynamika cenowa rano sugeruje szybkie poszukiwanie nowego punktu równowagi po otwarciu sesji.
+
+2. Wtorek:
+
+  * Wzór: Mniejszy szczyt oczekiwania na zmianę ceny w godzinach 13:00–14:00 (do 40 sekund), stabilna dynamika rano.
+
+  * Interpretacja: Rynek staje się bardziej przewidywalny; cena zmienia się w sposób bardziej regularny niż w poniedziałek. Południowy zastój cenowy jest mniej dotkliwy, co świadczy o stabilniejszym napływie zleceń wpływających na kurs.
+
+3. Środa:
+
+  * Wzór: Podwójny szczyt przestojów cenowych – około 12:00 oraz między 13:00 a 14:00 (do 45 sekund).
+
+  * Interpretacja: Dwustopniowe wyhamowanie dynamiki zmian cen. Bardziej rwana charakterystyka wskazuje na mniejszą ciągłość w procesie formowania się ceny w środku tygodnia.
+
+4. Czwartek:
+
+  * Wzór: Szczyt bezwładności w godzinach 13:00–14:00, a następnie gwałtowne skrócenie czasu potrzebnego na zmianę ceny po 15:00.
+
+  * Interpretacja: Regularny rytm dobowy z silnym przyspieszeniem zmienności ceny w drugiej połowie dnia. Szybsze przeskoki ceny po 15:00 mogą wiązać się z dyskontowaniem informacji przed końcem tygodnia.
+
+5. Piątek:
+
+  * Wzór: Szczyt przestoju cenowego występuje wcześniej (12:00–13:00), po czym następuje radykalne przyspieszenie zmian kursu po 14:00.
+
+  * Interpretacja: Najkrótsze cenowe czasy trwania (najszybsze zmiany ceny) w drugiej połowie dnia, co wynika z agresywnego dostosowywania portfeli i zamykania pozycji przed weekendem.
+
+Spółka L:
+
+1. Poniedziałek:
+
+  * Wzór: Wyraźny szczyt oczekiwania na ruch ceny w godzinach 11:00–12:00 (blisko 60 sekund), przy relatywnie żwawych zmianach rano (40–45 sekund).
+
+  * Interpretacja: Niska dynamika cenowa na początku tygodnia (opóźnione reakcje na newsy weekendowe). Cena „stoi” najdłużej przed południem, co wskazuje na okres wyczekiwania u mniej płynnej spółki L.
+
+2. Wtorek:
+
+  * Wzór: Ekstremalna stagnacja cenowa w godzinach 13:00–14:00 (czas trwania do 70 sekund), ze stromym spadkiem (przyspieszeniem ceny) po 14:00.
+
+  * Interpretacja: Najbardziej wyraźny w skali tygodnia południowy „paraliż” kursu. Bardzo niska płynność cenowa w tym czasie sprawia, że każda zmiana o zadany próg wymaga długiego oczekiwania.
+
+3. Środa:
+
+  * Wzór: Dynamiczny ruch ceny (spadek czasu trwania) około 10:00 (do 35 sekund), po czym następuje szczyt bezwładności 13:00–14:00 (około 50 sekund).
+
+  * Interpretacja: Krótkotrwałe „ożywienie” cenowe rano (widoczne również u spółki H) sugeruje skorelowaną aktywność na obu walorach. Południowy zastój ma mniejszą amplitudę niż w poniedziałek.
+
+4. Czwartek:
+
+  * Wzór: Szczyt oczekiwania na zmianę kursu około 13:00 (ponad 60 sekund), z gwałtownym przyspieszeniem zmian po 15:00.
+
+  * Interpretacja: Charakterystyczne dla spółek o mniejszej płynności długie okresy braku ruchu ceny w południe, przerywane zwiększoną zmiennością pod koniec sesji (redukcja ekspozycji).
+
+5. Piątek:
+
+  * Wzór: Stabilizacja dynamiki 10:00–11:00, po czym szeroki i długi szczyt stagnacji (12:00–14:00) i drastyczne przyspieszenie ruchu ceny po 14:00.
+
+  * Interpretacja: Rynek spółki L jest w piątki bardzo podatny na południowy zastój, jednak końcówka sesji przynosi gwałtowne i szybkie zmiany ceny (duża presja na realizację zleceń przed weekendem).
+  
+Patrząc na przedstawione zestawienie 4 wykresów (szczególnie na wykresy weryfikacyjne), można jednoznacznie stwierdzić, że zabieg usunięcia sezonowości śróddziennej zakończył się sukcesem:
+
+1. Eliminacja wzorca „odwróconego U”
+
+  * Przed korektą: Wykresy surowe dla obu spółek wykazują klasyczny, wypukły kształt – czasy trwania są najkrótsze na otwarciu i zamknięciu, a najdłuższe w środku dnia (tzw. efekt lunchu).
+  * Po korekcie: Wyraźny „garb” całkowicie zniknął. Zastąpił go proces oscylujący wokół stałego poziomu, co jest kluczowe dla dalszego modelowania statystycznego.
+  
+2. Stabilizacja średniej (Indeks $\approx 1.0$)
+
+  * Na wykresach odsezonowanych oś Y nie pokazuje już sekund, lecz indeks (adjusted duration).
+  * Wartości oscylują stabilnie wokół poziomu 1.0 przez niemal całą sesję. Oznacza to, że model poprawnie „wyłapał” lokalną normę czasową dla każdej godziny i sprowadził dane do wspólnego mianownika.
+  
+3. Charakterystyka sygnału
+
+  * Dane po korekcie przypominają teraz biały szum. 
+  * Dzięki temu zabiegowi, ewentualne piki (odchylenia powyżej lub poniżej 1.0) nie wynikają już z pory dnia, ale z rzeczywistych, nietypowych zdarzeń rynkowych lub napływu istotnych informacji.
+
+### 2.4.2. Dopasowanie modeli ACD/LACD (1, 1) oraz (2, 2)
+
+Po usunięciu śróddziennej sezonowości możemy przystąpić do modelowania ACD/LACD dla obu spółek. Przeanalizowane zostaną modele ACD, LACD1, LACD2 oraz z rozkładami: Burra, Weibulla, Gamma, a następnie wybrana najlepsza kombinacja tych parametrów. Rozważane modele będą miały parametry p i q równe 1, a mastępnie sprawdzimy te dla p=q=2.
+
+```{r acd_modeling}
+# Przygotowanie danych dla modelowania ACD/LACD
+# Z założeń zadania, dane są już w daneH_adj i daneL_adj po usunięciu cykliczności
+
+# Przygotowanie danych - tworzenie wektorów czasów trwania
+durations_H <- daneH_adj_c$adjDur
+durations_L <- daneL_adj_c$adjDur
+
+# Usunięcie ewentualnych NA i wartości nie dodatnich
+durations_H <- na.omit(durations_H[durations_H > 0])
+durations_L <- na.omit(durations_L[durations_L > 0])
+
+# Funkcja dopasowująca wszystkie modele ACD/LACD z różnymi rozkładami
+fit_all_acd_models <- function(durations, company_name, p=1, q=1) {
+  cat("\n=== DOPASOWANIE MODELI ACD/LACD (", p, ", ", q, ") DLA", company_name, "===\n")
+  
+  # Lista do przechowywania modeli
+  models <- list()
+  results <- data.frame(Model = character(), AIC = numeric(), LogLik = numeric(),
+                       n_params = numeric(), stringsAsFactors = FALSE)
+  
+  # 1. Modele ACD(1,1)
+  
+  ## ACD(1,1) z rozkładem Weibulla
+  tryCatch({
+    model <- acdFit(
+      durations = durations,
+      model = "ACD",
+      dist = "weibull",
+      order = c(p, q),
+      output = FALSE
+    )
+    models[["ACD_Weibull"]] <- model
+    results <- rbind(results, data.frame(
+      Model = "ACD_Weibull",
+      AIC = model$goodnessOfFit$value[2],
+      LogLik = model$goodnessOfFit$value[1],
+      n_params = model$Npar 
+    ))
+    cat("Model ACD_Weibull dopasowany\n")
+  }, error = function(e) cat("Błąd w modelu ACD_Weibull:", e$message, "\n"))
+  
+  ## ACD(1,1) z rozkładem Burra
+  tryCatch({
+    model <- acdFit(
+      durations = durations,
+      model = "ACD",
+      dist = "burr",
+      order = c(p, q),
+      output = FALSE
+    )
+    models[["ACD_Burr"]] <- model
+    results <- rbind(results, data.frame(
+      Model = "ACD_Burr",
+      AIC = model$goodnessOfFit$value[2],
+      LogLik = model$goodnessOfFit$value[1],
+      n_params = model$Npar 
+    ))
+    cat("Model ACD_Burr dopasowany\n")
+  }, error = function(e) cat("Błąd w modelu ACD_Burr:", e$message, "\n"))
+  
+  ## ACD(1,1) z uogólnionym rozkładem Gamma
+  tryCatch({
+    model <- acdFit(
+      durations = durations,
+      model = "ACD",
+      dist = "gengamma",
+      order = c(p, q),
+      output = FALSE
+    )
+    models[["ACD_GenGamma"]] <- model
+    results <- rbind(results, data.frame(
+      Model = "ACD_GenGamma",
+      AIC = model$goodnessOfFit$value[2],
+      LogLik = model$goodnessOfFit$value[1],
+      n_params = model$Npar 
+    ))
+    cat("Model ACD_GenGamma dopasowany\n")
+  }, error = function(e) cat("Błąd w modelu ACD_GenGamma:", e$message, "\n"))
+  
+  # 2. Modele LACD1(1,1)
+  
+  ## LACD1(1,1) z rozkładem Weibulla
+  tryCatch({
+    model <- acdFit(
+      durations = durations,
+      model = "LACD1",
+      dist = "weibull",
+      order = c(p, q),
+      output = FALSE
+    )
+    models[["LACD1_Weibull"]] <- model
+    results <- rbind(results, data.frame(
+      Model = "LACD1_Weibull",
+      AIC = model$goodnessOfFit$value[2],
+      LogLik = model$goodnessOfFit$value[1],
+      n_params = model$Npar 
+    ))
+    cat("Model LACD1_Weibull dopasowany\n")
+  }, error = function(e) cat("Błąd w modelu LACD1_Weibull:", e$message, "\n"))
+  
+  ## LACD1(1,1) z rozkładem Burra
+  tryCatch({
+    model <- acdFit(
+      durations = durations,
+      model = "LACD1",
+      dist = "burr",
+      order = c(p, q),
+      output = FALSE
+    )
+    models[["LACD1_Burr"]] <- model
+    results <- rbind(results, data.frame(
+      Model = "LACD1_Burr",
+      AIC = model$goodnessOfFit$value[2],
+      LogLik = model$goodnessOfFit$value[1],
+      n_params = model$Npar 
+    ))
+    cat("Model LACD1_Burr dopasowany\n")
+  }, error = function(e) cat("Błąd w modelu LACD1_Burr:", e$message, "\n"))
+  
+  ## LACD1(1,1) z uogólnionym rozkładem Gamma
+  tryCatch({
+    model <- acdFit(
+      durations = durations,
+      model = "LACD1",
+      dist = "gengamma",
+      order = c(p, q),
+      output = FALSE
+    )
+    models[["LACD1_GenGamma"]] <- model
+    results <- rbind(results, data.frame(
+      Model = "LACD1_GenGamma",
+      AIC = model$goodnessOfFit$value[2],
+      LogLik = model$goodnessOfFit$value[1],
+      n_params = model$Npar 
+    ))
+    cat("Model LACD1_GenGamma dopasowany\n")
+  }, error = function(e) cat("Błąd w modelu LACD1_GenGamma:", e$message, "\n"))
+  
+  # 3. Modele LACD2(1,1)
+  
+  ## LACD2(1,1) z rozkładem Weibulla
+  tryCatch({
+    model <- acdFit(
+      durations = durations,
+      model = "LACD2",
+      dist = "weibull",
+      order = c(p, q),
+      output = FALSE
+    )
+    models[["LACD2_Weibull"]] <- model
+    results <- rbind(results, data.frame(
+      Model = "LACD2_Weibull",
+      AIC = model$goodnessOfFit$value[2],
+      LogLik = model$goodnessOfFit$value[1],
+      n_params = model$Npar 
+    ))
+    cat("Model LACD2_Weibull dopasowany\n")
+  }, error = function(e) cat("Błąd w modelu LACD2_Weibull:", e$message, "\n"))
+  
+  ## LACD2(1,1) z rozkładem Burra
+  tryCatch({
+    model <- acdFit(
+      durations = durations,
+      model = "LACD2",
+      dist = "burr",
+      order = c(p, q),
+      output = FALSE
+    )
+    models[["LACD2_Burr"]] <- model
+    results <- rbind(results, data.frame(
+      Model = "LACD2_Burr",
+      AIC = model$goodnessOfFit$value[2],
+      LogLik = model$goodnessOfFit$value[1],
+      n_params = model$Npar 
+    ))
+    cat("Model LACD2_Burr dopasowany\n")
+  }, error = function(e) cat("Błąd w modelu LACD2_Burr:", e$message, "\n"))
+  
+  ## LACD2(1,1) z uogólnionym rozkładem Gamma
+  tryCatch({
+    model <- acdFit(
+      durations = durations,
+      model = "LACD2",
+      dist = "gengamma",
+      order = c(p, q),
+      output = FALSE
+    )
+    models[["LACD2_GenGamma"]] <- model
+    results <- rbind(results, data.frame(
+      Model = "LACD2_GenGamma",
+      AIC = model$goodnessOfFit$value[2],
+      LogLik = model$goodnessOfFit$value[1],
+      n_params = model$Npar 
+    ))
+    cat("Model LACD2_GenGamma dopasowany\n")
+  }, error = function(e) cat("✗ Błąd w modelu LACD2_GenGamma:", e$message, "\n"))
+  
+  # Sortowanie wyników według AIC
+  results <- results %>% arrange(AIC)
+  
+  cat("\nWyniki modeli uporządkowane według kryterium AIC:\n")
+  print(results, digits = 3)
+  
+  # Wybór najlepszego modelu
+  best_model_name <- results$Model[1]
+  best_model <- models[[best_model_name]]
+  
+  cat("\n Najlepszy model według AIC:", best_model_name, "\n")
+  cat("Parametry modelu:\n")
+  print(coef(best_model), digits = 4)
+  
+  return(list(
+    all_models = models,
+    results = results,
+    best_model = best_model,
+    best_model_name = best_model_name
+  ))
+}
+
+# Dopasowanie modeli dla obu spółek
+results_H_1_1 <- fit_all_acd_models(durations_H, "SPÓŁKI H",p=1,q=1)
+results_L_1_1 <- fit_all_acd_models(durations_L, "SPÓŁKI L",p=1,q=1)
+
+results_H_2_2 <- fit_all_acd_models(durations_H, "SPÓŁKI H",p=2,q=2)
+results_L_2_2 <- fit_all_acd_models(durations_L, "SPÓŁKI L",p=2,q=2)
+```
+1. Analiza modeli z parametrami (1, 1)
+
+W tej klasie parametrów testowano modele ACD, LACD1 oraz LACD2 z różnymi rozkładami składnika losowego.
+
+  * Spółka H:
+    - Najlepszy model: LACD1_GenGamma ($AIC = 176369$).
+    - Zwycięski rozkład: Uogólniony rozkład Gamma (GenGamma) okazał się bezkonkurencyjny, zajmując pierwsze trzy miejsca w rankingu AIC dla wszystkich typów modeli (LACD1, ACD, LACD2).
+    - Parametry: Model wykazuje bardzo wysoką trwałość (persistence), gdzie $\beta_1 = 0.9531$. Parametr $\alpha_1$ na poziomie $0.1356$ wskazuje na istotną reakcję na ostatnią zaobserwowaną zmianę ceny.
+  
+  * Spółka L:
+    - Najlepszy model: ACD_GenGamma ($AIC = 122947$).
+    - Charakterystyka: Model LACD2_GenGamma uzyskał niemal identyczny wynik AIC ($122961$), co sugeruje, że dla spółki L struktura logarytmiczna i standardowa ACD dają zbliżone rezultaty.
+    
+2. Analiza modeli z parametrami (2, 2)
+
+Zwiększenie rzędu opóźnień miało na celu sprawdzenie, czy uwzględnienie głębszej historii czasów trwania poprawi zdolność predykcyjną modeli.
+
+  * Spółka H:
+    - Najlepszy model: ACD_GenGamma ($AIC = 179651$).
+    - Wniosek: Porównując AIC, model $(2, 2)$ dla spółki H ($179651$) jest gorszy (wyższe AIC) od modelu $(1, 1)$ ($176369$). Dodatkowe parametry wprowadziły niepotrzebne skomplikowanie bez istotnej poprawy dopasowania.
+    - Problemy numeryczne: Przy optymalizacji modeli Weibulla wystąpiły błędy (brak zbieżności), co często zdarza się przy zbyt rozbudowanych modelach ACD na danych o wysokiej częstotliwości.
+  
+  * Spółka L:
+    - Najlepszy model: LACD2_GenGamma ($AIC = 122918$).
+    - Wniosek: W przypadku spółki L, model $(2, 2)$ uzyskał nieznacznie lepszy wynik niż model $(1, 1)$ ($122947$ vs $122918$). Sugeruje to, że w danych mniej płynnej spółki L występuje nieco bardziej złożona struktura zależności czasowych.
+    
+3. Wnioski ogólne
+  
+  * Dominacja rozkładu GenGamma: Na wszystkich etapach uogólniony rozkład Gamma (GenGamma) deklasuje rozkłady Burra i Weibulla. Oznacza to, że funkcja intensywności zmian cen ma specyficzny kształt, którego prostsze rozkłady nie są w stanie poprawnie oddać.Optymalny rząd modelu:
+    - Dla Spółki H (bardziej płynnej) optymalnym wyborem jest prostszy model (1, 1).
+    - Dla Spółki L model (2, 2) wygrywa matematycznie, choć różnica w AIC jest na tyle mała, że z punktu widzenia oszczędności parametrów model (1, 1) również pozostaje solidnym wyborem.
+    - Persistence (Trwałość): Wysokie wartości parametrów $\beta$ (często $> 0.9$) potwierdzają zjawisko grupowania się zmian cen – po szybkich zmianach ceny z dużym prawdopodobieństwem nastąpią kolejne szybkie zmiany
+
+
+## 2.5. Diagnostyka modeli (1, 1) oraz (2, 2)
+
+### 2.5.1. Diagnostyka modeli (1, 1)
+
+```{r diagnostic}
+# Funkcja diagnostyczna dla wybranego modelu
+model_diagnostics <- function(model, model_name, company_name) {
+  cat("\n=== DIAGNOSTYKA DLA MODELU", model_name, "(", company_name, ") ===\n")
+  
+  # 1. Standaryzacja reszt z transformacją PIT
+  std_resids <- standardizeResi(model, transformation = "probIntegral")
+  
+  # 2. Test Andersona-Darlinga dla jednostajności
+  ad_test <- ad.test(std_resids, null = "punif")
+  cat("\nTest Andersona-Darlinga dla standaryzowanych reszt (PIT):\n")
+  cat("Statystyka testowa:", round(ad_test$statistic, 4), "\n")
+  cat("Wartość p:", round(ad_test$p.value, 4), "\n")
+  if (ad_test$p.value > 0.05) {
+    cat("Test nie odrzuca hipotezy zerowej - rozkład jest jednostajny\n")
+  } else {
+    cat("Test odrzuca hipotezę zerową - rozkład nie jest jednostajny\n")
+  }
+  
+  # 3. Testy autokorelacji
+  residuals <- residuals(model)
+  squared_residuals <- residuals^2
+  
+  lb_test <- Box.test(residuals, lag = 50, type = "Ljung-Box")
+  lb_test_sq <- Box.test(squared_residuals, lag = 50, type = "Ljung-Box")
+  
+  cat("\nTest Ljunga-Boxa dla reszt:\n")
+  cat("Statystyka:", round(lb_test$statistic, 4), 
+      "Wartość p:", round(lb_test$p.value, 4), "\n")
+  if (lb_test$p.value > 0.05) {
+    cat("Brak istotnej autokorelacji w resztach\n")
+  } else {
+    cat("Istotna autokorelacja w resztach\n")
+  }
+  
+  cat("\nTest Ljunga-Boxa dla kwadratów reszt:\n")
+  cat("Statystyka:", round(lb_test_sq$statistic, 4), 
+      "Wartość p:", round(lb_test_sq$p.value, 4), "\n")
+  if (lb_test_sq$p.value > 0.05) {
+    cat("Brak istotnej autokorelacji w kwadratach reszt\n")
+  } else {
+    cat("Istotna autokorelacja w kwadratach reszt\n")
+  }
+  
+  # 4. Wykres dystrybuanty empirycznej vs teoretycznej
+  ecdf_data <- data.frame(x = std_resids)
+  ecdf_plot <- ggplot(ecdf_data, aes(x = x)) +
+    stat_ecdf(geom = "step", color = "#2E86AB", size = 1.2) +
+    geom_abline(intercept = 0, slope = 1, color = "#A23B72", linetype = "dashed", size = 1) +
+    labs(title = paste("Dystrybuanta empiryczna vs teoretyczna", 
+                      "\nModel:", model_name, "dla", company_name),
+         subtitle = paste("Test A-D: p =", round(ad_test$p.value, 4)),
+         x = "Wartości (PIT)", y = "Dystrybuanta") +
+    theme_minimal(base_size = 14) +
+    theme(plot.subtitle = element_text(color = ifelse(ad_test$p.value > 0.05, "#138D75", "#CB4335")))
+  
+  # 5. Wykres autokorelacji
+  acf_plot <- ggAcf(residuals, lag.max = 500, 
+                   main = paste("ACF reszt dla", model_name, 
+                               "\np =", round(lb_test$p.value, 4)))
+  acf_sq_plot <- ggAcf(squared_residuals, lag.max = 500, 
+                      main = paste("ACF kwadratów reszt dla", model_name,
+                                  "\np =", round(lb_test_sq$p.value, 4)))
+  
+  # Wyświetlenie wykresów
+  print(ecdf_plot)
+  print(acf_plot)
+  print(acf_sq_plot)
+  
+  return(list(
+    ad_test = ad_test,
+    lb_test = lb_test,
+    lb_test_sq = lb_test_sq,
+    standardized_residuals = std_resids
+  ))
+}
+
+# Przeprowadzenie diagnostyki dla najlepszych modeli
+diagnostics_H_1_1 <- model_diagnostics(results_H_1_1$best_model, results_H_1_1$best_model_name, "SPÓŁKI H")
+```
+***Wnioski dla spółki H:***
+
+1. Analiza dopasowania rozkładu (PIT)
+
+  * Test Andersona-Darlinga: Wynik testu ($p = 0$) jednoznacznie wskazuje na odrzucenie hipotezy zerowej. Oznacza to, że reszty po transformacji PIT (Probability Integral Transform) nie mają rozkładu jednostajnego.
+  * Wykres dystrybuanty (CDF): Wizualizacja potwierdza wynik testu statystycznego. Dystrybuanta empiryczna (niebieska linia) wyraźnie odbiega od teoretycznej (przerywana czerwona linia), szczególnie w środkowej części rozkładu, gdzie widoczne jest wybrzuszenie, oraz w ogonach.
+  * Wniosek: Założony rozkład błędów (GenGamma) przy specyfikacji modelu (1, 1) nie opisuje poprawnie struktury danych spółki H. Model ma problem z właściwym odwzorowaniem prawdopodobieństwa występowania poszczególnych duracji.
+  
+2. Analiza autokorelacji reszt (ACF i Ljung-Box)
+
+  * Test Ljunga-Boxa dla reszt: Statystyka jest ogromna (2624.7), a $p = 0$. Wskazuje to na silną, istotną statystycznie autokorelację, która pozostała w resztach.
+  * Wykres ACF reszt: Wykres jest bardzo niepokojący dla poprawności modelu. Widzimy bardzo dużą liczbę prążków wystających ponad przedziały ufności (niebieskie przerywane linie). Co istotne, autokorelacja wygasa bardzo powoli (nawet dla opóźnień rzędu 500 wciąż jest istotna).
+  * Wniosek: Model LACD(1, 1) nie wyczyścił zależności liniowych z danych. Wolne wygasanie funkcji ACF sugeruje, że w danych może występować zjawisko długiej pamięci (long memory), którego krótki model (1, 1) nie jest w stanie uchwycić, lub że specyfikacja dynamiki warunkowej wartości oczekiwanej jest niewłaściwa.
+  
+3. Analiza autokorelacji kwadratów reszt (Nieliniowość)
+
+  * Test Ljunga-Boxa dla kwadratów reszt: Podobnie jak przy zwykłych resztach, $p = 0$ przy wysokiej statystyce testowej (602.7).
+  * Wykres ACF kwadratów reszt: Obserwujemy liczne, istotne statystycznie prążki, w tym bardzo wyraźne "klastry" wysokich korelacji (np. wokół opóźnienia 170 czy 400).
+  * Wniosek: Model nie poradził sobie z usunięciem efektów nieliniowych (skupiania zmienności/duracji). Wariancja warunkowa lub momenty wyższych rzędów nadal wykazują strukturę opartą na zależnościach.
+  
+4. Podsumowanie dla Spółki H:
+
+Model LACD(1, 1) GenGamma jest niedopasowany do danych spółki H. Nie spełnia żadnego z kryteriów diagnostycznych:
+
+  * Źle opisuje rozkład danych.
+  * Pozostawia silną autokorelację w resztach (model jest "za krótki" lub zła specyfikacja).
+  * Nie usuwa zależności nieliniowych.
+
+Wygląda na to, że dynamika transakcji spółki H jest zbyt złożona dla standardowego modelu (1, 1).
+
+```{r}
+diagnostics_L_1_1 <- model_diagnostics(results_L_1_1$best_model, results_L_1_1$best_model_name, "SPÓŁKI L")
+```
+***Wnioski dla spółki L:***
+
+1. Analiza dopasowania rozkładu (PIT)
+
+  * Test Andersona-Darlinga: Podobnie jak w przypadku spółki H, wartość $p = 0$ wskazuje na odrzucenie hipotezy o jednostajnym rozkładzie reszt standaryzowanych. Statystycznie model nie jest idealnie dopasowany.
+  * Wykres dystrybuanty (CDF): Tutaj widać znaczącą różnicę w porównaniu do spółki H. Wykres dystrybuanty empirycznej (niebieska linia) pokrywa się z teoretyczną (czerwona przerywana) znacznie lepiej. Występują jedynie niewielkie odchylenia w dolnym ogonie (przy wartościach bliskich 0).
+  * Wniosek: Mimo że test statystyczny (który jest bardzo czuły przy dużych próbach) odrzuca dopasowanie, wizualna ocena sugeruje, że rozkład GenGamma radzi sobie ze strukturą danych spółki L o wiele lepiej niż w przypadku spółki H.
+  
+2. Analiza autokorelacji reszt (ACF i Ljung-Box)
+
+  * Test Ljunga-Boxa dla reszt: Statystyka wynosi 226.98, co przy $p = 0$ oznacza istotną statystycznie autokorelację. Warto jednak zauważyć, że ta wartość jest ponad 10-krotnie niższa niż dla spółki H (tam wynosiła ponad 2600).
+  * Wykres ACF reszt: Widoczna jest wyraźna struktura autokorelacji, szczególnie w początkowych lagach, gdzie obserwujemy serię ujemnych korelacji wystających poza przedziały ufności.
+  * Wniosek: Model ACD(1, 1) nadal nie wychwytuje całej dynamiki czasowej duracji (szczególnie krótkookresowej zmienności), ale skala problemu jest mniejsza niż w spółce H.
+  
+3. Analiza autokorelacji kwadratów reszt (Nieliniowość)
+
+  * Test Ljunga-Boxa dla kwadratów reszt: Statystyka 148.6 ($p = 0$) potwierdza występowanie zależności nieliniowych.
+  * Wykres ACF kwadratów reszt: Widać pojedyncze, wyraźne "szpilki" (np. silny pik w okolicy 170. opóźnienia, podobnie jak w spółce H, oraz mniejszy przy opóźnieniu 20).
+  * Wniosek: Wariancja warunkowa lub inne nieliniowe efekty nie zostały w pełni wygładzone przez model, choć tło (szum) wydaje się nieco spokojniejsze niż w poprzednim przypadku.
+  
+4. Podsumowanie dla Spółki L
+
+Model ACD(1, 1) GenGamma dla spółki L wypada zdecydowanie lepiej niż odpowiednik dla spółki H, ale nadal nie jest modelem w pełni poprawnym:
+  
+  * Rozkład teoretyczny jest wizualnie bliski empirycznemu (duży plus względem spółki H).
+  * Parametryzacja $(1, 1)$ jest wciąż niewystarczająca, aby usunąć autokorelację – model pozostawia systematyczne zależności w resztach.
+  * Pozostałe korelacje są sygnałem, że rząd modelu (1, 1) jest matematycznie zbyt ubogi, by opisać strukturę zależności między kolejnymi transakcjami po odjęciu sezonowości.
+  
+Wygląda na to, że dane spółki L są "łatwiejsze" do modelowania lub mają mniej ekstremalnych zdarzeń, ale wciąż wymagają bardziej złożonej struktury opóźnień (większego rzędu modelu).
+
+***Ocena modeli:***
+
+Modele o parametrach (1, 1) okazały się statystycznie niewystarczające dla obu spółek, jednak jakość dopasowania drastycznie się różni.
+
+Dla spółki H model jest nieakceptowalny: nie uchwycił ani kształtu rozkładu, bo widać wyraźne odchylenia na wykresie, ani silnych zależności w czasie, bo występuje ogromna autokorelacja reszt, co sugeruje, że dynamika tej spółki jest zbyt złożona lub wykazuje cechy długiej pamięci.
+
+Dla spółki L model radzi sobie znacznie lepiej: wizualnie poprawnie odwzorowuje rozkład duracji, a autokorelacja reszt, choć nadal istotna statystycznie, jest ponad 10-krotnie mniejsza niż w przypadku spółki H, co sugeruje, że brakuje tu jedynie dostrojenia rzędu modelu, czyli zastosowania wyższych wartości parametrów.
+
+### 2.5.2. Diagnostyka modeli (2, 2)
+
+```{r}
+diagnostics_H_2_2 <- model_diagnostics(results_H_2_2$best_model, results_H_2_2$best_model_name, "SPÓŁKI H")
+```
+
+***Wnioski dla spółki H:***
+
+1. Analiza dopasowania rozkładu (PIT)
+
+  * Test Andersona-Darlinga: Statystyka wynosi 154.92, co jest wynikiem niemal identycznym jak w modelu (1, 1) (tam było 155.98). Wartość $p = 0$ nadal nakazuje odrzucenie hipotezy zerowej.
+  * Wniosek: Zwiększenie rzędu modelu z (1, 1) do (2, 2) w ogóle nie poprawiło dopasowania rozkładu. Oznacza to, że problem leży w samej specyfikacji rozkładu błędów (GenGamma) lub jego parametrach kształtu, a nie w dynamice warunkowej wartości oczekiwanej. Model nadal błędnie szacuje prawdopodobieństwo wystąpienia określonych długości duracji (nadal mamy to samo "wybrzuszenie" na wykresie dystrybuanty).
+  
+2. Analiza autokorelacji reszt (ACF i Ljung-Box)
+  * Test Ljunga-Boxa dla reszt: Statystyka spadła z poziomu 2624.7 (w modelu 1, 1) do poziomu 783.69. Jest to ogromna poprawa (redukcja statystyki o ok. 70%), choć przy $p=0$ autokorelacja nadal jest istotna statystycznie.
+  * Wykres ACF: Choć statystyka spadła, model nadal nie jest idealny. Zazwyczaj przy takim spadku statystyki testowej obserwujemy wyczyszczenie korelacji długookresowych, ale mogą pozostawać silne korelacje na pierwszych opóźnieniach (tzw. short-range dependence), których model (2, 2) jeszcze nie "domknął".
+  * Wniosek: Dodanie parametrów (2, 2) pomogło modelowi wychwycić znacznie więcej zależności czasowych, ale dla Spółki H to wciąż za mało, by mówić o pełnym sukcesie (białym szumie).
+
+3. Analiza autokorelacji kwadratów reszt (Nieliniowość)
+  * Test Ljunga-Boxa dla kwadratów reszt: Tutaj widzimy największy sukces. Statystyka spadła z 602.7 (w modelu (1, 1)) do 118.09.
+  * Wniosek: Model (2, 2) znacznie lepiej radzi sobie z nieliniowościami i efektami skupiania niż model (1, 1). Choć $p=0$, to poziom zależności w drugiej potędze reszt został drastycznie zredukowany (pięciokrotnie mniejsza statystyka testowa).
+
+4. Podsumowanie dla Spółki H
+
+Przejście na model wyższego rzędu ACD(2, 2) przyniosło mieszane rezultaty dla trudnej w modelowaniu spółki H:
+  * Dynamika (ACF): Znaczna poprawa. Model lepiej opisuje zależności czasowe i nieliniowe (statystyki Ljunga-Boxa wyraźnie spadły).
+  * Rozkład (PIT): Brak poprawy. Zwiększenie liczby opóźnień nie naprawiło systematycznego błędu w dopasowaniu kształtu rozkładu (Dystrybuanta nadal odstaje od teoretycznej
+
+Wygląda na to, że dla spółki H potrzebna byłaby zmiana rodziny rozkładów albo jeszcze bardziej złożona dynamika, choć obecny model (2, 2) jest już znacznie bardziej poprawny pod względem dynamiki niż (1, 1).
+
+```{r}
+diagnostics_L_2_2 <- model_diagnostics(results_L_2_2$best_model, results_L_2_2$best_model_name, "SPÓŁKI L")
+```
+
+***Wnioski dla spółki L:***
+
+1. Analiza dopasowania rozkładu (PIT)
+
+  * Test Andersona-Darlinga: Statystyka wynosi 95.65, co jest wynikiem bardzo zbliżonym (nawet minimalnie gorszym) do modelu (1, 1), gdzie wynosiła 92.83. Wartość $p = 0$ oznacza, że hipoteza zerowa jest odrzucona.
+  * Wykres dystrybuanty (CDF):  Podobnie jak w wersji (1, 1), dopasowanie wizualne jest przyzwoite. Linia empiryczna pokrywa się z teoretyczną na większości przedziału, z niewielkimi odchyleniami w dolnym ogonie.
+  * Wniosek: Rozszerzenie modelu do (2, 2) nie poprawiło dopasowania statycznego rozkładu. Oznacza to, że rodzina GenGamma dobrze (choć nie idealnie w sensie statystycznym) aproksymuje dane spółki L, a dodanie parametrów dynamicznych nie wpływa na ten aspekt.
+  
+2. Analiza autokorelacji reszt (ACF i Ljung-Box)
+
+  * Test Ljunga-Boxa dla reszt: Statystyka spadła z 226.98 (model (1, 1)) do 156.91. To wyraźna poprawa (redukcja o ok. 30%), istotna, ale niska w porównaniu do innych, a autokorelacja pozostaje istotna statystycznie. Model ACD(2, 2) wyczerpał swoje możliwości w klasie modeli o krótkiej pamięci. Pozostała autokorelacja nie wynika z pory dnia, lecz z faktu, że duracje wykazują zależności długookresowe (long memory), których prosta struktura (2, 2) nie jest w stanie w pełni modelować. Jest to  cecha samego procesu stochastycznego spółki L
+  * Wykres ACF:  Widać charakterystyczną dla modeli ACD zmienność na początku (tzw. short-lag autocorrelation). Mimo że test Ljunga-Boxa jest istotny, znaczna część prążków na dalszych opóźnieniach mieści się w granicach przedziałów ufności.
+  * Wniosek: Model (2, 2) radzi sobie lepiej z usuwaniem liniowych zależności niż (1, 1), ale wciąż pozostawia pewną strukturę w krótkim okresie. Jest to jednak wynik znacznie czystszy niż w przypadku spółki H.
+  
+3. Analiza autokorelacji kwadratów reszt (Nieliniowość)
+
+  * Test Ljunga-Boxa dla kwadratów reszt: Tutaj nastąpiła znacząca poprawa – spadek statystyki ze 148.6 (model (1, 1)) do 98.85.
+  * Wykres ACF kwadratów: Skoro sezonowość została usunięta, to występowanie wyraźnej korelacji w kwadratach reszt przy opóźnieniu ok. 170 świadczy o tym, że funkcja sezonowości nie dopasowała się idealnie do lokalnych ekstremów zmienności, albo co bardziej prawdopodobne, istnieje specyficzny rytm strukturalny na rynku, który nie ma charakteru płynnej fali (którą usuwa filtracja), lecz punktowego zdarzenia.
+  * Wniosek: Model (2, 2) skutecznie redukuje efekty skupiania zmienności dla spółki L, mimo że osiągnięto wynik poniżej 100 w statystyce LB. Dla tak dużej próby jest to i tak relatywnie dobrym rezultatem.
+
+***Ocena modeli:***
+
+Dla Spółki H (Model LACD2_GenGamma): Model ten jest nadal niewystarczający. Mimo dodania parametrów, nie udało się wyeliminować silnej autokorelacji reszt (LB ~780), a dopasowanie rozkładu (test PIT) w ogóle się nie poprawiło. Wskazuje to, że specyfika spółki H (np. długa pamięć procesu lub "grube ogony") wykracza poza możliwości standardowego modelu ACD, nawet rzędu (2, 2).
+
+Dla Spółki L (Model LACD2_GenGamma): Model ten oceniamy jako dobry i akceptowalny praktycznie. Bardzo skutecznie wygasił nieliniowe zależności (autokorelacja kwadratów reszt spadła poniżej 100), a dopasowanie rozkładu jest wizualnie poprawne. Pozostałe niewielkie "szpilki" w autokorelacji wynikają prawdopodobnie ze specyficznego szumu mikrostrukturalnego, którego modele klasy ACD już nie wyłapią.
+
+Jesteśmy w sytuacji, w której mając do czynienia z danymi wysokiej częstotliwości i setkami tysięcy obserwacji szerokość przedziału ufności staje się niesamowicie niska. Z tego powodu nawet śladowa autokorelacja rzędu 0,03, która ekonomicznie nie ma znaczenia, staje się statystycznie istotna i przeważa o dopasowaniu modelu.
+
+
+***Wnioski dotyczące przejścia z modeli (1, 1) na modele (2, 2)***
+
+1. Spółka H ("Trudna")
+
+  * Efekt zmiany (1, 1) $\rightarrow$ (2, 2):
+  
+    - Dynamika: Nastąpiła znaczna redukcja statystyk Ljunga-Boxa (dla reszt z ~2600 na ~780, dla kwadratów z ~600 na ~118). Model (2, 2) lepiej radzi sobie ze skupianiem zmienności.
+    - Rozkład: Zmiana rzędu modelu nie dała żadnej poprawy w dopasowaniu gęstości prawdopodobieństwa (wykresy PIT i statystyki A-D są niemal identyczne).
+  
+  * Wniosek: Dla spółki H proste zwiększanie rzędu opóźnień (p, q) pomaga jedynie częściowo, a błąd modelowania leży głębiej. W kwestii niewłaściwego doboru rodziny rozkładów nie możemy zrobić wiele, gdyż mimo, że GenGamma nie pasuje do tych danych, to był najlepszy spośród swoich konkurentów.
+  
+2. Spółka L ("Łatwiejsza")
+
+  * Efekt zmiany (1, 1) $\rightarrow$ (2, 2):
+  
+    - Dynamika: Przejście na (2, 2) wyczyściło model. Zredukowało autokorelację kwadratów reszt o ok. 33% (z 148 do 98), eliminując większość efektów nieliniowych.
+    - Rozkład: Podobnie jak przy spółce H, zmiana rzędu nie wpłynęła na statystykę dopasowania rozkładu, ale w tym przypadku wyjściowe dopasowanie (wizualne) było już dobre.
+    
+  * Wniosek: Dla spółki L zwiększenie rzędu do (2, 2) było kluczowym i skutecznym ruchem. Model (1, 1) był niedouczony, natomiast model (2, 2) poprawnie uchwycił strukturę zależności czasowych w danych odsezonowanych.
+
+3. Generalna konkluzja: Zwiększanie rzędu modelu ACD (z (1,1) na (2,2)) świetnie sprawdza się w dostrajaniu modelu do dynamiki danych, czyli usuwaniu autokorelacji, ale jest bezużyteczne w naprawianiu złego dopasowania kształtu rozkładu. Jeśli wykres PIT jest zły w modelu (1,1), to w modelu (2,2) też będzie zły.
+
+## 2.6. Funkcje hazardu dla optymalnych modeli
+
+```{r include=FALSE}
+# Funkcja hazardu dla najlepszych modeli
+# Określenie zakresu dla osi X (do 95 percentyla)
+xstop_H <- quantile(durations_H, 0.95, na.rm = TRUE)
+xstop_L <- quantile(durations_L, 0.95, na.rm = TRUE)
+
+# Rysowanie funkcji hazardu
+hazard_plot_H_1_1 <- plotHazard(
+  results_H_1_1$best_model,
+  breaks = 30,
+  implied = TRUE,
+  xstop = xstop_H
+)
+
+# Modyfikacja tytułu i etykiet
+hazard_plot_H_1_1 <- hazard_plot_H_1_1 +
+  labs(title = paste("Funkcja hazardu dla SPÓŁKI H\nModel:", results_H_1_1$best_model_name,  "(1, 1)"),
+       x = "Czas trwania", y = "Intensywność hazardu") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+
+hazard_plot_L_1_1 <- plotHazard(
+  results_L_1_1$best_model,
+  breaks = 30,
+  implied = TRUE,
+  xstop = xstop_L
+) +
+  labs(title = paste("Funkcja hazardu dla SPÓŁKI L\nModel:", results_L_1_1$best_model_name, "(1, 1)"),
+       x = "Czas trwania", y = "Intensywność hazardu") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+
+
+hazard_plot_H_2_2 <- plotHazard(
+  results_H_2_2$best_model,
+  breaks = 30,
+  implied = TRUE,
+  xstop = xstop_H
+)
+
+# Modyfikacja tytułu i etykiet
+hazard_plot_H_2_2 <- hazard_plot_H_2_2 +
+  labs(title = paste("Funkcja hazardu dla SPÓŁKI H\nModel:", results_H_2_2$best_model_name,  "(2, 2)"),
+       x = "Czas trwania", y = "Intensywność hazardu") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+
+
+hazard_plot_L_2_2 <- plotHazard(
+  results_L_2_2$best_model,
+  breaks = 30,
+  implied = TRUE,
+  xstop = xstop_L
+) +
+  labs(title = paste("Funkcja hazardu dla SPÓŁKI L\nModel:", results_L_2_2$best_model_name, "(2, 2)"),
+       x = "Czas trwania", y = "Intensywność hazardu") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r}
+# Wyświetlenie obu wykresów
+hazard_plot_H_1_1
+hazard_plot_L_1_1
+hazard_plot_H_2_2
+hazard_plot_L_2_2
+```
+
+***Wnioski dla H:***
+
+1. Charakterystyka empiryczna (Czarna linia):
+
+  * Kształt: Funkcja hazardu dla spółki H ma wyraźny kształt odwróconego U (hump-shaped). Prawdopodobieństwo wystąpienia transakcji jest niskie w bardzo krótkim czasie po poprzedniej (efekt latencji/opóźnienia technicznego), gwałtownie rośnie osiągając szczyt (maksymalne ryzyko transakcji) w okolicy $t \approx 0.1-0.2$, a następnie powoli, monotonicznie maleje.
+  * Interpretacja rynkowa: Malejąca część hazardu (dla $t > 0.2$) świadczy o ujemnej zależności od czasu trwania (ang. negative duration dependence). Oznacza to inercję rynku: jeśli transakcja nie nastąpiła szybko, to im dłużej czekamy, tym mniejsza szansa, że nastąpi "teraz" (rynek "stygnie").
+  
+2. Dopasowanie modelu (Czerwona linia) - (1,1) vs (2,2):
+  * Model (1, 1): Teoretyczna krzywa (czerwona) próbuje naśladować kształt odwróconego U, ale wyraźnie nie dosięga szczytu empirycznego hazardu. Model nie docenia prawdopodobieństwa wystąpienia transakcji w najbardziej "gorącym" momencie. Ponadto, dla dłuższych czasów (ogon rozkładu, $t > 1.5$) czerwona linia leży poniżej czarnej – model "gubi" ryzyko w długich okresach ciszy.
+  * Model (2, 2): Przejście na parametry (2, 2) nie zmieniło drastycznie kształtu krzywej teoretycznej (nadal wynika ona z rozkładu GenGamma), ale widać delikatną poprawę w dopasowaniu w środkowej części wykresu. Mimo to, główny problem pozostaje: model nie jest w stanie wygenerować tak ostrego "piku" hazardu, jaki występuje w danych rzeczywistych.
+  
+3. Wniosek wiążący z uprzednią diagnostyką: To wyjaśnia, dlaczego Test Andersona-Darlinga (PIT) odrzucił model. Rozbieżność między linią czarną a czerwoną to wizualny dowód na to, że rozkład GenGamma jest zbyt "sztywny", by opisać specyficzną mikrostrukturę spółki H.
+
+
+***Wnioski dla L:***
+
+1. Charakterystyka empiryczna (Czarna linia):
+  * Kształt: Funkcja hazardu wygląda inaczej niż w H. Jest znacznie bardziej stroma na początku. Szczyt następuje niemal natychmiast po $t=0$, po czym następuje gwałtowny spadek.
+  * Interpretacja rynkowa: Spółka L charakteryzuje się bardzo agresywnym handlem krótkoterminowym. Jeśli transakcja ma nastąpić, następuje niemal natychmiast. Jeśli nie nastąpi od razu, prawdopodobieństwo drastycznie spada.
+
+2. Dopasowanie modelu (Czerwona linia) - (1,1) vs (2,2):
+  * Model (1, 1): Czerwona linia jest znacznie "gładsza" niż rzeczywistość. Model ACD(1,1) uśrednia zachowanie rynku – nie docenia gwałtowności hazardu przy bardzo krótkich duracjach (czarne punkty są wysoko nad czerwoną linią przy $t \approx 0$) i przeszacowuje hazard w strefie "średniej" ($t \approx 0.5$).
+  * Model (2, 2): Tutaj widać kluczową poprawę, o której mówiliśmy przy ACF. Choć czerwona linia nadal nie osiąga samego szczytu (pik jest ekstremalnie wysoki), to dla czasów $t > 0.5$ (prawa strona wykresu) czerwona linia niemal idealnie pokrywa się z czarnymi punktami.
+
+3. Wniosek wiążący z uprzednią diagnostyką: To potwierdza, dlaczego model (2, 2) dla spółki L był "akceptowalny". Poza początkowym szumem (wynikającym z mikrostruktury), model świetnie opisuje tempo wygasania prawdopodobieństwa transakcji dla średnich i długich duracji.
+
+## Zbiorcze podsumowanie dopasowania modeli oraz funkcji hazardu
+
+Analiza wykresów porównujących funkcje hazaru z rozkładem innowacji rzuca nowe światło na różnice między modelami:
+
+1. Ograniczenia rozkładu GenGamma: W obu spółkach widać, że teoretyczna funkcja innowacji (czerwona) jest zbyt płaska w porównaniu do danych empirycznych. Rzeczywiste rynki mają tendencję do generowania bardziej ekstremalnych zachowań (bardzo wysoki hazard w krótkim czasie), czego ten konkretny rozkład parametryczny nie potrafi w pełni "rozciągnąć".
+
+2. Rola parametrów (2, 2):
+
+  * W Spółce L dodanie parametrów (2, 2) pozwoliło "dokleić" ogon hazardu (prawa strona wykresu) do danych, co poskutkowało dobrym wyczyszczeniem autokorelacji.
+
+  * W Spółce H problem leży w samym kształcie garbu. Model (2, 2) poprawił dynamikę czasową, ale nie naprawił strukturalnego niedopasowania kształtu krzywej hazardu.
+
+Wnioskując na podstawie tych wykresów, można stwierdzić, że dla spółki H konieczne byłoby zastosowanie rozkładu, który dopuszcza bardziej elastyczną funkcję hazardu (np. mieszanki rozkładów), ponieważ GenGamma systematycznie nie docenia ryzyka transakcji w kluczowych momentach aktywności rynku (na szczycie hazardu).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
